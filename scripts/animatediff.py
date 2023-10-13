@@ -78,6 +78,9 @@ class AnimateDiffScript(scripts.Script):
             os.mkdir(model_dir)
         model_list = [f for f in os.listdir(model_dir) if f != ".gitkeep"]
         if len(model_list)<1:
+            if os.path.isdir(os.path.join('/stable-diffusion-cache', 'models/AnimateDiff')):
+                model_list = [f for f in os.listdir(model_dir) if f != ".gitkeep"]
+        if len(model_list)<1:
             for model_name in model_urls:
                 os.system(f'wget {model_urls[model_name]} -O {model_dir}/{model_name}')
         model_list = [f for f in os.listdir(model_dir) if f != ".gitkeep"]

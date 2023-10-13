@@ -10,6 +10,10 @@ from modules.devices import torch_gc, device, cpu
 from modules.processing import StableDiffusionProcessing, Processed
 from scripts.logging_animatediff import logger_animatediff
 from motion_module import MotionWrapper, VanillaTemporalModule
+model_urls = {
+    'mm_sd_v15.ckpt':'https://huggingface.co/guoyww/animatediff/resolve/main/mm_sd_v15.ckpt', 
+    'mm_sd_v15_v2.ckpt':'https://huggingface.co/guoyww/animatediff/resolve/main/mm_sd_v15_v2.ckpt'
+}
 
 
 from ldm.modules.diffusionmodules.openaimodel import TimestepBlock, TimestepEmbedSequential
@@ -44,6 +48,7 @@ class AnimateDiffScript(scripts.Script):
 
     def __init__(self):
         self.logger = logger_animatediff
+        self.inject_successful = False
 
     def title(self):
         return "AnimateDiff"
@@ -66,9 +71,15 @@ class AnimateDiffScript(scripts.Script):
         gc.collect()
 
     def ui(self, is_img2img):
-        model_dir = shared.opts.data.get("animatediff_model_path", os.path.join(script_dir, "model"))
+        model_dir = shared.opts.data.get("animatediff_model_path", os.path.join(shared.cmd_opts.data_dir, "models/AnimateDiff"))
+        if shared.cmd_opts.just_ui and shared.eas_server:
+            model_dir = shared.opts.data.get("animatediff_model_path", os.path.join(os.path.dirname(shared.cmd_opts.data_dir), "models/AnimateDiff"))
         if not os.path.isdir(model_dir):
             os.mkdir(model_dir)
+        model_list = [f for f in os.listdir(model_dir) if f != ".gitkeep"]
+        if len(model_list)<1:
+            for model_name in model_urls:
+                os.system(f'wget {model_urls[model_name]} -O {model_dir}/{model_name}')
         model_list = [f for f in os.listdir(model_dir) if f != ".gitkeep"]
         with gr.Accordion('AnimateDiff', open=False):
             with gr.Row():
@@ -98,8 +109,9 @@ class AnimateDiffScript(scripts.Script):
         return enable, loop_number, video_length, fps, model
 
     def inject_motion_modules(self, p: StableDiffusionProcessing, model_name="mm_sd_v15.ckpt"):
-        model_path = os.path.join(shared.opts.data.get("animatediff_model_path", os.path.join(script_dir, "model")), model_name)
+        model_path = os.path.join(shared.opts.data.get("animatediff_model_path", os.path.join(shared.cmd_opts.data_dir, "models/AnimateDiff")), model_name)
         if not os.path.isfile(model_path):
+            self.inject_successful = False
             raise RuntimeError("Please download models manually.")
         def get_mm_hash(model_name="mm_sd_v15.ckpt"):
             model_hash = hashes.sha256(model_path, f"AnimateDiff/{model_name}")
@@ -156,8 +168,11 @@ class AnimateDiffScript(scripts.Script):
             self.logger.info(f"Injecting motion module {model_name} into SD1.5 UNet middle block.")
             unet.middle_block.insert(-1, AnimateDiffScript.motion_module.mid_block.motion_modules[0])
         self.logger.info(f"Injection finished.")
+        self.inject_successful = True
 
     def remove_motion_modules(self, p: StableDiffusionProcessing):
+        if not self.inject_successful:
+            return
         unet = p.sd_model.model.diffusion_model
         self.logger.info(f"Removing motion module from SD1.5 UNet input blocks.")
         for unet_idx in [1, 2, 4, 5, 7, 8, 10, 11]:
@@ -201,6 +216,9 @@ class AnimateDiffScript(scripts.Script):
                 self.set_ddim_alpha(p)
 
     def postprocess(self, p: StableDiffusionProcessing, res: Processed, enable_animatediff=False, loop_number=0, video_length=16, fps=8, model="mm_sd_v15.ckpt"):
+        if shared.cmd_opts.just_ui:
+            self.logger.info("AnimateDiff process end.")
+            return
         if enable_animatediff:
             self.remove_motion_modules(p)
             video_paths = []
@@ -219,7 +237,7 @@ class AnimateDiffScript(scripts.Script):
 
 def on_ui_settings():
     section = ('animatediff', "AnimateDiff")
-    shared.opts.add_option("animatediff_model_path", shared.OptionInfo(os.path.join(script_dir, "model"), "Path to save AnimateDiff motion modules", gr.Textbox, section=section))
+    shared.opts.add_option("animatediff_model_path", shared.OptionInfo(os.path.join(shared.cmd_opts.data_dir, "models/AnimateDiff"), "Path to save AnimateDiff motion modules", gr.Textbox, section=section))
     shared.opts.add_option("animatediff_hack_gn", shared.OptionInfo(
         True, "Check if you want to hack GroupNorm. By default, V1 hacks GroupNorm, which avoids a performance degradation. "
         "If you choose not to hack GroupNorm for V1, you will be able to use this extension in img2img in all cases, but the generated GIF will have flickers. "

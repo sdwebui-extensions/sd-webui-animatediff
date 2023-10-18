@@ -49,6 +49,7 @@ class AnimateDiffScript(scripts.Script):
     def __init__(self):
         self.logger = logger_animatediff
         self.inject_successful = False
+        self.enable_animatediff = False
 
     def title(self):
         return "AnimateDiff"
@@ -212,15 +213,22 @@ class AnimateDiffScript(scripts.Script):
         p.sd_model.alphas_cumprod_prev = alphas_cumprod_prev
 
     def before_process(self, p: StableDiffusionProcessing, enable_animatediff=False, loop_number=0, video_length=16, fps=8, model="mm_sd_v15.ckpt"):
+        self.enable_animatediff = enable_animatediff
+        self.model = model
         if enable_animatediff:
             self.logger.info(f"AnimateDiff process start with video Max frames {video_length}, FPS {fps}, duration {video_length/fps},  motion module {model}.")
             assert video_length > 0 and fps > 0, "Video length and FPS should be positive."
             p.batch_size = video_length
-            self.inject_motion_modules(p, model)
             if p.sampler_name == "DDIM":
                 self.set_ddim_alpha(p)
+    
+    def process(self, p, *args, **kwargs):
+        if self.enable_animatediff:
+            self.inject_motion_modules(p, self.model)
+        return
 
     def postprocess(self, p: StableDiffusionProcessing, res: Processed, enable_animatediff=False, loop_number=0, video_length=16, fps=8, model="mm_sd_v15.ckpt"):
+        self.enable_animatediff = False
         if shared.cmd_opts.just_ui:
             self.logger.info("AnimateDiff process end.")
             return

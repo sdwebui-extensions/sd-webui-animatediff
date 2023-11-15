@@ -153,6 +153,13 @@ class AnimateDiffUiGroup:
                     new_model_list = [
                         f for f in os.listdir(model_dir) if f != ".gitkeep"
                     ]
+                    if len(new_model_list)<1:
+                        if os.path.exists('/stable-diffusion-cache/models/AnimateDiff'):
+                            for file_path in os.listdir('/stable-diffusion-cache/models/AnimateDiff'):
+                                os.system(f'cp /stable-diffusion-cache/models/AnimateDiff/{file_path} {model_dir}')
+                            new_model_list = [
+                                f for f in os.listdir(model_dir) if f != ".gitkeep"
+                            ]
                     dd = inputs[0]
                     if dd in new_model_list:
                         selected = dd

@@ -1,13 +1,35 @@
+from enum import Enum
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from modules import sd_hijack, shared
 from ldm.modules.attention import FeedForward
 
 from einops import rearrange, repeat
 import math
+
+
+class MotionModuleType(Enum):
+    AnimateDiffV1 = "AnimateDiff V1, Yuwei GUo, Shanghai AI Lab"
+    AnimateDiffV2 = "AnimateDiff V2, Yuwei Guo, Shanghai AI Lab"
+    AnimateDiffXL = "AnimateDiff SDXL, Yuwei Guo, Shanghai AI Lab"
+    HotShotXL = "HotShot-XL, John Mullan, Natural Synthetics Inc"
+
+
+    @staticmethod
+    def get_mm_type(state_dict: dict):
+        keys = list(state_dict.keys())
+        if any(["mid_block" in k for k in keys]):
+            return MotionModuleType.AnimateDiffV2
+        elif any(["temporal_attentions" in k for k in keys]):
+            return MotionModuleType.HotShotXL
+        elif any(["down_blocks.3" in k for k in keys]):
+            return MotionModuleType.AnimateDiffV1
+        else:
+            return MotionModuleType.AnimateDiffXL
 
 
 def zero_module(module):
@@ -18,37 +40,40 @@ def zero_module(module):
 
 
 class MotionWrapper(nn.Module):
-    def __init__(self, mm_hash: str, using_v2: bool):
+    def __init__(self, mm_name: str, mm_hash: str, mm_type: MotionModuleType):
         super().__init__()
-        if using_v2:
-            max_len = 32
-        else:
-            max_len = 24
+        self.is_v2 = mm_type == MotionModuleType.AnimateDiffV2
+        self.is_hotshot = mm_type == MotionModuleType.HotShotXL
+        self.is_adxl = mm_type == MotionModuleType.AnimateDiffXL
+        self.is_xl = self.is_hotshot or self.is_adxl
+        max_len = 32 if (self.is_v2 or self.is_adxl) else 24
+        in_channels = (320, 640, 1280) if (self.is_hotshot or self.is_adxl) else (320, 640, 1280, 1280)
         self.down_blocks = nn.ModuleList([])
         self.up_blocks = nn.ModuleList([])
-        for c in (320, 640, 1280, 1280):
-            self.down_blocks.append(MotionModule(c, max_len=max_len))
-        for c in (1280, 1280, 640, 320):
-            self.up_blocks.append(MotionModule(c, is_up=True, max_len=max_len))
-        if using_v2:
-            self.mid_block = MotionModule(1280, max_len=max_len, is_mid=using_v2)
+        for c in in_channels:
+            self.down_blocks.append(MotionModule(c, num_mm=2, max_len=max_len, is_hotshot=self.is_hotshot))
+            self.up_blocks.insert(0,MotionModule(c, num_mm=3, max_len=max_len, is_hotshot=self.is_hotshot))
+        if self.is_v2:
+            self.mid_block = MotionModule(1280, num_mm=1, max_len=max_len)
+        self.mm_name = mm_name
+        self.mm_type = mm_type
         self.mm_hash = mm_hash
-        self.using_v2 = using_v2
 
 
 class MotionModule(nn.Module):
-    def __init__(self, in_channels, is_up=False, is_mid=False, max_len=24):
+    def __init__(self, in_channels, num_mm, max_len, is_hotshot=False):
         super().__init__()
-        if is_mid:
-            self.motion_modules = nn.ModuleList([get_motion_module(in_channels, max_len)])
+        motion_modules = nn.ModuleList([get_motion_module(in_channels, max_len, is_hotshot) for _ in range(num_mm)])
+        if is_hotshot:
+            self.temporal_attentions = motion_modules
         else:
-            self.motion_modules = nn.ModuleList([get_motion_module(in_channels, max_len), get_motion_module(in_channels, max_len)])
-            if is_up:
-                self.motion_modules.append(get_motion_module(in_channels, max_len))
+            self.motion_modules = motion_modules
 
 
-def get_motion_module(in_channels, max_len):
-    return VanillaTemporalModule(in_channels=in_channels, temporal_position_encoding_max_len=max_len)
+
+def get_motion_module(in_channels, max_len, is_hotshot):
+    vtm = VanillaTemporalModule(in_channels=in_channels, temporal_position_encoding_max_len=max_len, is_hotshot=is_hotshot)
+    return vtm.temporal_transformer if is_hotshot else vtm
 
 
 class VanillaTemporalModule(nn.Module):
@@ -63,6 +88,7 @@ class VanillaTemporalModule(nn.Module):
         temporal_position_encoding_max_len = 24,
         temporal_attention_dim_div         = 1,
         zero_initialize                    = True,
+        is_hotshot                            = False,
     ):
         super().__init__()
         
@@ -75,13 +101,14 @@ class VanillaTemporalModule(nn.Module):
             cross_frame_attention_mode=cross_frame_attention_mode,
             temporal_position_encoding=temporal_position_encoding,
             temporal_position_encoding_max_len=temporal_position_encoding_max_len,
+            is_hotshot=is_hotshot,
         )
         
         if zero_initialize:
             self.temporal_transformer.proj_out = zero_module(self.temporal_transformer.proj_out)
 
 
-    def forward(self, input_tensor, encoder_hidden_states, attention_mask=None):
+    def forward(self, input_tensor, encoder_hidden_states=None, attention_mask=None): # TODO: encoder_hidden_states do seem to be always None
         return self.temporal_transformer(input_tensor, encoder_hidden_states, attention_mask)
 
 
@@ -104,6 +131,7 @@ class TemporalTransformer3DModel(nn.Module):
         cross_frame_attention_mode         = None,
         temporal_position_encoding         = False,
         temporal_position_encoding_max_len = 24,
+        is_hotshot                            = False,
     ):
         super().__init__()
 
@@ -128,6 +156,7 @@ class TemporalTransformer3DModel(nn.Module):
                     cross_frame_attention_mode=cross_frame_attention_mode,
                     temporal_position_encoding=temporal_position_encoding,
                     temporal_position_encoding_max_len=temporal_position_encoding_max_len,
+                    is_hotshot=is_hotshot,
                 )
                 for d in range(num_layers)
             ]
@@ -135,7 +164,7 @@ class TemporalTransformer3DModel(nn.Module):
         self.proj_out = nn.Linear(inner_dim, in_channels)    
     
     def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None):
-        video_length = hidden_states.shape[0] // 2 # TODO: config this value in scripts
+        video_length = hidden_states.shape[0] // (2 if shared.opts.batch_cond_uncond else 1)
         batch, channel, height, weight = hidden_states.shape
         residual = hidden_states
 
@@ -172,6 +201,7 @@ class TemporalTransformerBlock(nn.Module):
         cross_frame_attention_mode         = None,
         temporal_position_encoding         = False,
         temporal_position_encoding_max_len = 24,
+        is_hotshot                            = False,
     ):
         super().__init__()
 
@@ -194,6 +224,7 @@ class TemporalTransformerBlock(nn.Module):
                     cross_frame_attention_mode=cross_frame_attention_mode,
                     temporal_position_encoding=temporal_position_encoding,
                     temporal_position_encoding_max_len=temporal_position_encoding_max_len,
+                    is_hotshot=is_hotshot,
                 )
             )
             norms.append(nn.LayerNorm(dim))
@@ -225,7 +256,8 @@ class PositionalEncoding(nn.Module):
         self, 
         d_model, 
         dropout = 0., 
-        max_len = 24
+        max_len = 24,
+        is_hotshot = False,
     ):
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
@@ -234,10 +266,11 @@ class PositionalEncoding(nn.Module):
         pe = torch.zeros(1, max_len, d_model)
         pe[0, :, 0::2] = torch.sin(position * div_term)
         pe[0, :, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
+        self.register_buffer('positional_encoding' if is_hotshot else 'pe', pe)
+        self.is_hotshot = is_hotshot
 
     def forward(self, x):
-        x = x + self.pe[:, :x.size(1)]
+        x = x + (self.positional_encoding[:, :x.size(1)] if self.is_hotshot else self.pe[:, :x.size(1)])
         return self.dropout(x)
 
 
@@ -283,8 +316,7 @@ class CrossAttention(nn.Module):
         # You can set slice_size with `set_attention_slice`
         self.sliceable_head_dim = heads
         self._slice_size = None
-        # self._use_memory_efficient_attention_xformers = shared.xformers_available
-        self._use_memory_efficient_attention_xformers = False
+
         self.added_kv_proj_dim = added_kv_proj_dim
 
         if norm_num_groups is not None:
@@ -364,8 +396,8 @@ class CrossAttention(nn.Module):
                 attention_mask = attention_mask.repeat_interleave(self.heads, dim=0)
 
         # attention, what we cannot get enough of
-        if self._use_memory_efficient_attention_xformers:
-            hidden_states = self._memory_efficient_attention_xformers(query, key, value, attention_mask)
+        if sd_hijack.current_optimizer is not None and sd_hijack.current_optimizer.name in ["xformers", "sdp", "sdp-no-mem", "sub-quadratic"]:
+            hidden_states = self._memory_efficient_attention(query, key, value, attention_mask, sd_hijack.current_optimizer.name)
             # Some versions of xformers return output in fp32, cast it back to the dtype of the input
             hidden_states = hidden_states.to(query.dtype)
         else:
@@ -455,16 +487,39 @@ class CrossAttention(nn.Module):
         hidden_states = self.reshape_batch_dim_to_heads(hidden_states)
         return hidden_states
 
-    def _memory_efficient_attention_xformers(self, query, key, value, attention_mask):
+    def _memory_efficient_attention(self, q, k, v, mask, current_optimizer_name):
         # TODO attention_mask
-        query = query.contiguous()
-        key = key.contiguous()
-        value = value.contiguous()
-        import xformers.ops
-        from modules.sd_hijack_optimizations import get_xformers_flash_attention_op
-        hidden_states = xformers.ops.memory_efficient_attention(query, key, value, attn_bias=attention_mask, 
-                                                                op=get_xformers_flash_attention_op(query, key, value))
-        hidden_states = self.reshape_batch_dim_to_heads(hidden_states)
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+
+        if current_optimizer_name == "xformers":
+            import xformers.ops
+            from modules.sd_hijack_optimizations import get_xformers_flash_attention_op
+            hidden_states = xformers.ops.memory_efficient_attention(
+                q, k, v, attn_bias=mask,
+                op=get_xformers_flash_attention_op(q, k, v))
+        elif current_optimizer_name == "sdp":
+            hidden_states = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False
+            )
+        elif current_optimizer_name == "sdp-no-mem":
+            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=False):
+                hidden_states = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False
+                )
+        elif current_optimizer_name == "sub-quadratic":
+            from modules.sd_hijack_optimizations import sub_quad_attention
+            from modules import shared
+            hidden_states = sub_quad_attention(
+                q, k, v, 
+                q_chunk_size=shared.cmd_opts.sub_quad_q_chunk_size, 
+                kv_chunk_size=shared.cmd_opts.sub_quad_kv_chunk_size, 
+                chunk_threshold=shared.cmd_opts.sub_quad_chunk_threshold, 
+                use_checkpoint=self.training
+            )
+
+        hidden_states = self.reshape_batch_dim_to_heads(hidden_states)        
         return hidden_states
 
 
@@ -474,7 +529,8 @@ class VersatileAttention(CrossAttention):
             attention_mode                     = None,
             cross_frame_attention_mode         = None,
             temporal_position_encoding         = False,
-            temporal_position_encoding_max_len = 24,            
+            temporal_position_encoding_max_len = 24,
+            is_hotshot                            = False,       
             *args, **kwargs
         ):
         super().__init__(*args, **kwargs)
@@ -486,7 +542,8 @@ class VersatileAttention(CrossAttention):
         self.pos_encoder = PositionalEncoding(
             kwargs["query_dim"],
             dropout=0., 
-            max_len=temporal_position_encoding_max_len
+            max_len=temporal_position_encoding_max_len,
+            is_hotshot=is_hotshot,
         ) if (temporal_position_encoding and attention_mode == "Temporal") else None
 
     def extra_repr(self):
@@ -531,9 +588,17 @@ class VersatileAttention(CrossAttention):
                 attention_mask = F.pad(attention_mask, (0, target_length), value=0.0)
                 attention_mask = attention_mask.repeat_interleave(self.heads, dim=0)
 
+        xformers_option = shared.opts.data.get("animatediff_xformers", "Optimize attention layers with xformers")
+        optimizer_collections = ["xformers", "sdp", "sdp-no-mem", "sub-quadratic"]
+        if xformers_option == "Do not optimize attention layers": # "Do not optimize attention layers"
+            optimizer_collections = optimizer_collections[1:]
+
         # attention, what we cannot get enough of
-        if self._use_memory_efficient_attention_xformers:
-            hidden_states = self._memory_efficient_attention_xformers(query, key, value, attention_mask)
+        if sd_hijack.current_optimizer is not None and sd_hijack.current_optimizer.name in optimizer_collections:
+            optimizer_name = sd_hijack.current_optimizer.name
+            if xformers_option == "Optimize attention layers with sdp (torch >= 2.0.0 required)" and optimizer_name == "xformers":
+                optimizer_name = "sdp" # "Optimize attention layers with sdp (torch >= 2.0.0 required)"
+            hidden_states = self._memory_efficient_attention(query, key, value, attention_mask, optimizer_name)
             # Some versions of xformers return output in fp32, cast it back to the dtype of the input
             hidden_states = hidden_states.to(query.dtype)
         else:
@@ -552,4 +617,3 @@ class VersatileAttention(CrossAttention):
             hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d)
 
         return hidden_states
-

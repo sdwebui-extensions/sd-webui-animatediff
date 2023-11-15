@@ -1,4 +1,5 @@
 import gradio as gr
+
 from modules import script_callbacks, scripts, shared
 from modules.processing import (Processed, StableDiffusionProcessing,
                                 StableDiffusionProcessingImg2Img)
@@ -15,6 +16,7 @@ from scripts.animatediff_output import AnimateDiffOutput
 from scripts.animatediff_ui import AnimateDiffProcess, AnimateDiffUiGroup
 from scripts.animatediff_infotext import update_infotext
 
+
 script_dir = scripts.basedir()
 motion_module.set_script_dir(script_dir)
 
@@ -26,6 +28,7 @@ class AnimateDiffScript(scripts.Script):
         self.cfg_hacker = None
         self.cn_hacker = None
         self.prompt_scheduler = None
+
 
 
     def title(self):

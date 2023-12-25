@@ -28,6 +28,7 @@ class AnimateDiffScript(scripts.Script):
         self.cfg_hacker = None
         self.cn_hacker = None
         self.prompt_scheduler = None
+        self.hacked = False
 
 
 
@@ -59,6 +60,13 @@ class AnimateDiffScript(scripts.Script):
             self.cn_hacker = AnimateDiffControl(p, self.prompt_scheduler)
             self.cn_hacker.hack(params)
             update_infotext(p, params)
+            self.hacked = True
+        elif self.hacked:
+            self.cn_hacker.restore()
+            self.cfg_hacker.restore()
+            self.lora_hacker.restore()
+            motion_module.restore(p.sd_model)
+            self.hacked = False
 
 
     def before_process_batch(self, p: StableDiffusionProcessing, params: AnimateDiffProcess, **kwargs):
@@ -87,12 +95,14 @@ class AnimateDiffScript(scripts.Script):
             self.cfg_hacker.restore()
             self.lora_hacker.restore()
             motion_module.restore(p.sd_model)
+            self.hacked = False
             AnimateDiffOutput().output(p, res, params)
             logger.info("AnimateDiff process end.")
 
 
 def on_ui_settings():
     section = ("animatediff", "AnimateDiff")
+    s3_selection =("animatediff", "AnimateDiff AWS") 
     shared.opts.add_option(
         "animatediff_model_path",
         shared.OptionInfo(
@@ -119,6 +129,45 @@ def on_ui_settings():
             gr.Checkbox,
             section=section
         )
+    )
+    shared.opts.add_option(
+        key="animatediff_mp4_crf",
+        info=shared.OptionInfo(
+            default=23,
+            label="MP4 Quality (CRF)",
+            component=gr.Slider,
+            component_args={
+                "minimum": 0,
+                "maximum": 51,
+                "step": 1},
+            section=section
+        )
+        .link("docs", "https://trac.ffmpeg.org/wiki/Encode/H.264#crf")
+        .info("17 for best quality, up to 28 for smaller size")
+    )
+    shared.opts.add_option(
+        key="animatediff_mp4_preset",
+        info=shared.OptionInfo(
+            default="",
+            label="MP4 Encoding Preset",
+            component=gr.Dropdown,
+            component_args={"choices": ["", 'veryslow', 'slower', 'slow', 'medium', 'fast', 'faster', 'veryfast', 'superfast', 'ultrafast']},
+            section=section,
+        )
+        .link("docs", "https://trac.ffmpeg.org/wiki/Encode/H.264#Preset")
+        .info("encoding speed, use the slowest you can tolerate")
+    )
+    shared.opts.add_option(
+        key="animatediff_mp4_tune",
+        info=shared.OptionInfo(
+            default="",
+            label="MP4 Tune encoding for content type",
+            component=gr.Dropdown,
+            component_args={"choices": ["", "film", "animation", "grain"]},
+            section=section
+        )
+        .link("docs", "https://trac.ffmpeg.org/wiki/Encode/H.264#Tune")
+        .info("optimize for specific content types")
     )
     shared.opts.add_option(
         "animatediff_webp_quality",
@@ -164,7 +213,70 @@ def on_ui_settings():
             section=section
         )
     )
-
-
+    shared.opts.add_option(
+        "animatediff_disable_lcm",
+        shared.OptionInfo(
+            False,
+            "Disable LCM",
+            gr.Checkbox,
+            section=section
+        )
+    )
+    shared.opts.add_option(
+        "animatediff_s3_enable",
+        shared.OptionInfo(
+            False,
+            "Enable to Store file in object storage that supports the s3 protocol",
+            gr.Checkbox,
+            section=s3_selection
+        )
+    )
+    shared.opts.add_option(
+        "animatediff_s3_host",
+        shared.OptionInfo(
+            None,
+            "S3 protocol host",
+            gr.Textbox,
+            section=s3_selection,
+        ),
+    )
+    shared.opts.add_option(
+        "animatediff_s3_port",
+        shared.OptionInfo(
+            None,
+            "S3 protocol port",
+            gr.Textbox,
+            section=s3_selection,
+        ),
+    )
+    shared.opts.add_option(
+        "animatediff_s3_access_key",
+        shared.OptionInfo(
+            None,
+            "S3 protocol access_key",
+            gr.Textbox,
+            section=s3_selection,
+        ),
+    )
+    shared.opts.add_option(
+        "animatediff_s3_secret_key",
+        shared.OptionInfo(
+            None,
+            "S3 protocol secret_key",
+            gr.Textbox,
+            section=s3_selection,
+        ),
+    )
+    shared.opts.add_option(
+        "animatediff_s3_storge_bucket",
+        shared.OptionInfo(
+            None,
+            "Bucket for file storage",
+            gr.Textbox,
+            section=s3_selection,
+        ),
+    )    
+    
 script_callbacks.on_ui_settings(on_ui_settings)
 script_callbacks.on_after_component(AnimateDiffUiGroup.on_after_component)
+script_callbacks.on_before_ui(AnimateDiffUiGroup.on_before_ui)

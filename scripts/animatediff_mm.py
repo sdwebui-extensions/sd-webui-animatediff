@@ -3,7 +3,7 @@ import os
 
 import torch
 from einops import rearrange
-from modules import hashes, shared, sd_models
+from modules import hashes, shared, sd_models, devices
 from modules.devices import cpu, device, torch_gc
 
 from motion_module import MotionWrapper, MotionModuleType
@@ -47,6 +47,10 @@ class AnimateDiffMM:
         self.mm.to(device).eval()
         if not shared.cmd_opts.no_half:
             self.mm.half()
+            if getattr(devices, "fp8", False):
+                for module in self.mm.modules():
+                    if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear)):
+                        module.to(torch.float8_e4m3fn)
 
 
     def inject(self, sd_model, model_name="mm_sd_v15.ckpt"):
@@ -63,7 +67,7 @@ class AnimateDiffMM:
         if self.mm.is_v2:
             logger.info(f"Injecting motion module {model_name} into {sd_ver} UNet middle block.")
             unet.middle_block.insert(-1, self.mm.mid_block.motion_modules[0])
-        elif not self.mm.is_adxl:
+        elif self.mm.enable_gn_hack():
             logger.info(f"Hacking {sd_ver} GroupNorm32 forward function.")
             if self.mm.is_hotshot:
                 from sgm.modules.diffusionmodules.util import GroupNorm32
@@ -106,6 +110,10 @@ class AnimateDiffMM:
 
 
     def restore(self, sd_model):
+        if not AnimateDiffMM.mm_injected:
+            logger.info("Motion module already removed.")
+            return
+
         inject_sdxl = sd_model.is_sdxl or self.mm.is_xl
         sd_ver = "SDXL" if sd_model.is_sdxl else "SD1.5"
         self._restore_ddim_alpha(sd_model)
@@ -129,7 +137,7 @@ class AnimateDiffMM:
         if self.mm.is_v2:
             logger.info(f"Removing motion module from {sd_ver} UNet middle block.")
             unet.middle_block.pop(-2)
-        elif not self.mm.is_adxl:
+        elif self.mm.enable_gn_hack():
             logger.info(f"Restoring {sd_ver} GroupNorm32 forward function.")
             if self.mm.is_hotshot:
                 from sgm.modules.diffusionmodules.util import GroupNorm32

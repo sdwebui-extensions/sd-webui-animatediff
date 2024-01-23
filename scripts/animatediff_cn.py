@@ -139,7 +139,7 @@ class AnimateDiffControl:
         cn_script = self.cn_script
 
 
-        def hacked_main_entry(self, p: StableDiffusionProcessing):
+        def hacked_main_entry(self, p: StableDiffusionProcessing, batch_option_uint_separate="All ControlNet units for all images in a batch", batch_option_style_align=False):
             from scripts import external_code, global_state, hook
             from scripts.controlnet_lora import bind_control_lora
             from scripts.adapter import Adapter, Adapter_light, StyleAdapter

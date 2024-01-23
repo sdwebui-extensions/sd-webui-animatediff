@@ -14,7 +14,7 @@ from scripts.animatediff_mm import mm_animatediff as motion_module
 from scripts.animatediff_prompt import AnimateDiffPromptSchedule
 from scripts.animatediff_output import AnimateDiffOutput
 from scripts.animatediff_ui import AnimateDiffProcess, AnimateDiffUiGroup
-from scripts.animatediff_infotext import update_infotext
+from scripts.animatediff_infotext import update_infotext, infotext_pasted
 
 
 script_dir = scripts.basedir()
@@ -29,6 +29,8 @@ class AnimateDiffScript(scripts.Script):
         self.cn_hacker = None
         self.prompt_scheduler = None
         self.hacked = False
+        self.infotext_fields: List[Tuple[gr.components.IOComponent, str]] = []
+        self.paste_field_names: List[str] = []
 
 
 
@@ -41,8 +43,13 @@ class AnimateDiffScript(scripts.Script):
 
 
     def ui(self, is_img2img):
-        return (AnimateDiffUiGroup().render(is_img2img, motion_module.get_model_dir()),)
-
+        unit = AnimateDiffUiGroup().render(
+            is_img2img,
+            motion_module.get_model_dir(),
+            self.infotext_fields,
+            self.paste_field_names
+        )
+        return (unit,)
 
     def before_process(self, p: StableDiffusionProcessing, params: AnimateDiffProcess):
         if p.is_api and isinstance(params, dict):
@@ -280,3 +287,4 @@ def on_ui_settings():
 script_callbacks.on_ui_settings(on_ui_settings)
 script_callbacks.on_after_component(AnimateDiffUiGroup.on_after_component)
 script_callbacks.on_before_ui(AnimateDiffUiGroup.on_before_ui)
+script_callbacks.on_infotext_pasted(infotext_pasted)

@@ -25,9 +25,15 @@ class AnimateDiffMM:
 
 
     def get_model_dir(self):
-        model_dir = shared.opts.data.get("animatediff_model_path", os.path.join(self.script_dir, "model"))
-        if not model_dir:
-            model_dir = os.path.join(self.script_dir, "model")
+        model_dir = os.path.join(shared.cmd_opts.data_dir, 'model/AnimateDiff')
+        if shared.cmd_opts.just_ui:
+            model_dir = os.path.join(os.path.dirname(shared.cmd_opts.data_dir), 'model/AnimateDiff')
+        if not os.path.exists(model_dir):
+            os.makedirs(model_dir, exist_ok=True)
+        if os.path.exists('/stable-diffusion-cache/models/AnimateDiff'):
+            for model_file in os.listdir('/stable-diffusion-cache/models/AnimateDiff'):
+                if not os.path.exists(os.path.join(model_dir, model_file)):
+                    os.system(f"cp /stable-diffusion-cache/models/AnimateDiff/{model_file} {os.path.join(model_dir, model_file)}")
         return model_dir
 
 

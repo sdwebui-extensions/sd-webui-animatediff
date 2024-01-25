@@ -105,7 +105,7 @@ class AnimateDiffInfV2V:
         def mm_cn_select(context: List[int]):
             # take control images for current context.
             if cn_script and cn_script.latest_network:
-                from scripts.hook import ControlModelType
+                from scripts.enums import ControlModelType
                 for control in cn_script.latest_network.control_params:
                     if control.control_model_type not in [ControlModelType.IPAdapter, ControlModelType.Controlllite]:
                         if control.hint_cond.shape[0] > len(context):

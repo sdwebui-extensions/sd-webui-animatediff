@@ -147,7 +147,8 @@ class AnimateDiffControl:
             from scripts.controlnet_lllite import PlugableControlLLLite, clear_all_lllite
             from scripts.controlmodel_ipadapter import (PlugableIPAdapter,
                                                         clear_all_ip_adapter)
-            from scripts.hook import ControlModelType, ControlParams, UnetHook
+            from scripts.hook import ControlParams, UnetHook
+            from scripts.enums import ControlModelType
             from scripts.logging import logger
             from scripts.processor import model_free_preprocessors
 
@@ -237,14 +238,21 @@ class AnimateDiffControl:
             self.latest_model_hash = p.sd_model.sd_model_hash
             for idx, unit in enumerate(self.enabled_units):
                 cn_script.bound_check_params(unit)
+                cn_script.check_sd_version_compatible(unit)
 
                 resize_mode = external_code.resize_mode_from_value(unit.resize_mode)
                 control_mode = external_code.control_mode_from_value(unit.control_mode)
 
                 if unit.module in model_free_preprocessors:
                     model_net = None
+                    if 'reference' in unit.module:
+                        control_model_type = ControlModelType.AttentionInjection
+                    elif 'revision' in unit.module:
+                        control_model_type = ControlModelType.ReVision
+                    else:
+                        raise Exception("Unable to determine control_model_type.")
                 else:
-                    model_net = cn_script.load_control_model(p, unet, unit.model)
+                    model_net, control_model_type = cn_script.load_control_model(p, unet, unit.model)
                     model_net.reset()
                     if model_net is not None and getattr(devices, "fp8", False) and not isinstance(model_net, PlugableIPAdapter):
                         for _module in model_net.modules():
@@ -255,67 +263,41 @@ class AnimateDiffControl:
                         control_lora = model_net.control_model
                         bind_control_lora(unet, control_lora)
                         p.controlnet_control_loras.append(control_lora)
+                        
+                    if control_model_type == ControlModelType.ControlLoRA:
+                        control_lora = model_net.control_model
+                        bind_control_lora(unet, control_lora)
+                        p.controlnet_control_loras.append(control_lora)
+                        # Change control_model_type to ControlNet as all processes
+                        # in hook.py still want the ControlNetLoRA to be treated
+                        # the same way as ControlNet.
+                        control_model_type = ControlModelType.ControlNet
+                
+                h, w, hr_y, hr_x = cn_script.get_target_dimensions(p)
 
                 if getattr(unit, 'input_mode', InputMode.SIMPLE) == InputMode.BATCH:
                     input_images = []
                     for img in unit.batch_images:
                         unit.image = img
-                        input_image, _ = cn_script.choose_input_image(p, unit, idx)
+                        input_image, resize_mode = cn_script.choose_input_image(p, unit, idx)
                         input_images.append(input_image)
                 else:
-                    input_image, image_from_a1111 = cn_script.choose_input_image(p, unit, idx)
+                    input_image, resize_mode = cn_script.choose_input_image(p, unit, idx)
                     input_images = [input_image]
 
-                    if image_from_a1111:
-                        a1111_i2i_resize_mode = getattr(p, "resize_mode", None)
-                        if a1111_i2i_resize_mode is not None:
-                            resize_mode = external_code.resize_mode_from_value(a1111_i2i_resize_mode)
-
                 for idx, input_image in enumerate(input_images):
-                    a1111_mask_image : Optional[Image.Image] = getattr(p, "image_mask", None)
-                    if a1111_mask_image and isinstance(a1111_mask_image, list):
-                        a1111_mask_image = a1111_mask_image[idx]
-                    if 'inpaint' in unit.module and not image_has_mask(input_image) and a1111_mask_image is not None:
-                        a1111_mask = np.array(prepare_mask(a1111_mask_image, p))
-                        if a1111_mask.ndim == 2:
-                            if a1111_mask.shape[0] == input_image.shape[0]:
-                                if a1111_mask.shape[1] == input_image.shape[1]:
-                                    input_image = np.concatenate([input_image[:, :, 0:3], a1111_mask[:, :, None]], axis=2)
-                                    a1111_i2i_resize_mode = getattr(p, "resize_mode", None)
-                                    if a1111_i2i_resize_mode is not None:
-                                        resize_mode = external_code.resize_mode_from_value(a1111_i2i_resize_mode)
-
-                    if 'reference' not in unit.module and issubclass(type(p), StableDiffusionProcessingImg2Img) \
-                            and p.inpaint_full_res and a1111_mask_image is not None:
-                        logger.debug("A1111 inpaint mask START")
-                        input_image = [input_image[:, :, i] for i in range(input_image.shape[2])]
-                        input_image = [Image.fromarray(x) for x in input_image]
-
-                        mask = prepare_mask(a1111_mask_image, p)
-
-                        crop_region = masking.get_crop_region(np.array(mask), p.inpaint_full_res_padding)
-                        crop_region = masking.expand_crop_region(crop_region, p.width, p.height, mask.width, mask.height)
-
-                        input_image = [
-                            images.resize_image(resize_mode.int_value(), i, mask.width, mask.height) 
-                            for i in input_image
-                        ]
-
-                        input_image = [x.crop(crop_region) for x in input_image]
-                        input_image = [
-                            images.resize_image(external_code.ResizeMode.OUTER_FIT.int_value(), x, p.width, p.height) 
-                            for x in input_image
-                        ]
-
-                        input_image = [np.asarray(x)[:, :, 0] for x in input_image]
-                        input_image = np.stack(input_image, axis=2)
-                        logger.debug("A1111 inpaint mask END")
-
-                    # safe numpy
-                    logger.debug("Safe numpy convertion START")
-                    input_image = np.ascontiguousarray(input_image.copy()).copy()
-                    logger.debug("Safe numpy convertion END")
-
+                    input_image = cn_script.try_crop_image_with_a1111_mask(p, unit, input_image, resize_mode)
+                    input_image = np.ascontiguousarray(input_image.copy()).copy() # safe numpy
+                    if unit.module == 'inpaint_only+lama' and resize_mode == external_code.ResizeMode.OUTER_FIT:
+                        # inpaint_only+lama is special and required outpaint fix
+                        _, input_image = cn_script.detectmap_proc(input_image, unit.module, resize_mode, hr_y, hr_x)
+                    if unit.pixel_perfect:
+                        unit.processor_res = external_code.pixel_perfect_resolution(
+                            input_image,
+                            target_H=h,
+                            target_W=w,
+                            resize_mode=resize_mode,
+                        )
                     input_images[idx] = input_image
 
                 if 'inpaint_only' == unit.module and issubclass(type(p), StableDiffusionProcessingImg2Img) and p.image_mask is not None:
@@ -327,20 +309,6 @@ class AnimateDiffControl:
 
                 high_res_fix = isinstance(p, StableDiffusionProcessingTxt2Img) and getattr(p, 'enable_hr', False)
 
-                h = (p.height // 8) * 8
-                w = (p.width // 8) * 8
-
-                if high_res_fix:
-                    if p.hr_resize_x == 0 and p.hr_resize_y == 0:
-                        hr_y = int(p.height * p.hr_scale)
-                        hr_x = int(p.width * p.hr_scale)
-                    else:
-                        hr_y, hr_x = p.hr_resize_y, p.hr_resize_x
-                    hr_y = (hr_y // 8) * 8
-                    hr_x = (hr_x // 8) * 8
-                else:
-                    hr_y = h
-                    hr_x = w
 
                 if unit.module == 'inpaint_only+lama' and resize_mode == external_code.ResizeMode.OUTER_FIT:
                     # inpaint_only+lama is special and required outpaint fix
@@ -422,11 +390,15 @@ class AnimateDiffControl:
                     if control_model_type == ControlModelType.IPAdapter:
                         if model_net.is_plus:
                             controls_ipadapter['hidden_states'].append(control['hidden_states'][-2].cpu())
+                        elif unit.module == 'ip-adapter_face_id':
+                            controls.append(control[0])
                         else:
                             controls_ipadapter['image_embeds'].append(control['image_embeds'].cpu())
                         if hr_control is not None:
                             if model_net.is_plus:
                                 hr_controls_ipadapter['hidden_states'].append(hr_control['hidden_states'][-2].cpu())
+                            elif unit.module == 'ip-adapter_face_id':
+                                hr_controls.append(control[0])
                             else:
                                 hr_controls_ipadapter['image_embeds'].append(hr_control['image_embeds'].cpu())
                         else:
@@ -439,7 +411,7 @@ class AnimateDiffControl:
                         else:
                             hr_controls = None
                 
-                if control_model_type == ControlModelType.IPAdapter:
+                if control_model_type == ControlModelType.IPAdapter and unit.module != 'ip-adapter_face_id':
                     ipadapter_key = 'hidden_states' if model_net.is_plus else 'image_embeds'
                     controls = {ipadapter_key: torch.cat(controls_ipadapter[ipadapter_key], dim=0)}
                     if controls[ipadapter_key].shape[0] > 1:
@@ -460,6 +432,10 @@ class AnimateDiffControl:
                         hr_controls = torch.cat(hr_controls, dim=0)
                         if hr_controls.shape[0] > 1:
                             hr_controls = torch.cat([hr_controls, hr_controls], dim=0)
+                if unit.module == 'ip-adapter_face_id':
+                    controls = [controls]
+                    if hr_controls is not None:
+                        hr_controls = [hr_controls]
 
                 preprocessor_dict = dict(
                     name=unit.module,

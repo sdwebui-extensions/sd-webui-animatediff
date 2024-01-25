@@ -41,7 +41,7 @@ class AnimateDiffOutput:
         if len(video_paths) == 0:
             return
         if (not p.do_not_save_grid) and (not p.do_not_save_samples):
-            res.images
+            res.images = video_paths
         else:
             res.images = video_paths if not p.is_api else (self._encode_video_to_b64(video_paths) + (frame_list if 'Frame' in params.format else []))
 
